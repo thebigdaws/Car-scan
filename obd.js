@@ -305,7 +305,7 @@ const LIVE_DEFAULT = [0x0c, 0x0d, 0x04, 0x05, 0x5c, 0x0f, 0x46, 0x06, 0x07, 0x08
   0x0e, 0x14, 0x15, 0x18, 0x19, 0x24, 0x34, 0x44, 0x2f, 0x42, 0x33, 0x1f];
 const SAMPLE_DEFAULT = [0x0c, 0x05, 0x06, 0x07, 0x08, 0x09, 0x10, 0x14, 0x15, 0x18, 0x19, 0x24];
 
-export async function scan(transport, { sampleSeconds = 10, onStep = () => {} } = {}) {
+export async function scan(transport, { sampleSeconds = 10, onStep = () => {}, keepOpen = false } = {}) {
   const elm = new ELM327(transport);
   const out = {};
   onStep("Connecting to the adapter…");
@@ -353,13 +353,27 @@ export async function scan(transport, { sampleSeconds = 10, onStep = () => {} } 
         out.sampled.sensors[name] = s;
       }
     }
-  } finally {
+  } catch (e) {
     await elm.close();
+    throw e;
   }
+  if (keepOpen) Object.defineProperty(out, "elm", { value: elm, enumerable: false });
+  else await elm.close();
   return out;
 }
 
 // --------------------------------------------------------------------------- report
+export const EXTRA_COMMANDS_HELP = `
+
+OPTIONAL, MORE DATA: The app can run extra read-only commands through the same ELM327 adapter, for example manufacturer-specific data such as tire pressures, transmission temperature, or ABS codes for this make/model (use the VIN). Only if it would really help, end your answer with a block exactly like this, one command per line, with a short label after "|":
+
+CARSCAN-COMMANDS
+ATSH 7E1 | transmission module
+22 1E1C | transmission fluid temp
+END
+
+Only read requests are allowed (services 01-0A, 18, 19, 1A, 21, 22 plus ATSH/ATCRA header settings); anything else is blocked by the app. Only send commands you are reasonably confident apply to this vehicle, and say how sure you are.`;
+
 export const QUESTION = `I plugged an OBD-II scanner into my car. The full scan is below. Act as an experienced, honest mechanic explaining it to a car owner who isn't a mechanic. Base everything on the data; when the data can't settle something, say so instead of guessing.
 
 Answer in this order:
@@ -372,7 +386,7 @@ Answer in this order:
 7. If a mechanic is needed, how to save money on this specific repair: independent shop vs dealer, whether to skip paying for a diagnostic fee since I already have this scan, whether warranty, a recall, or a service bulletin might cover it (for example the federal 8-year/80,000-mile emissions warranty on catalytic converters), fair price ranges so I can spot an overquote, upsells to politely decline, and whether buying the part myself makes sense.
 8. Anything else in the scan that looks off, even if it isn't causing the light.
 
-Keep it short and skimmable. If no codes are set and the readings look normal, say so plainly.`;
+Keep it short and skimmable. If no codes are set and the readings look normal, say so plainly.${EXTRA_COMMANDS_HELP}`;
 
 export const USED_CAR_QUESTION = `I'm thinking about buying this used car and plugged an OBD-II scanner into it. The full scan is below. Act as an experienced, honest mechanic helping a buyer who isn't a mechanic. Base everything on the data; when the data can't settle something, say so.
 
@@ -383,7 +397,7 @@ Answer in this order:
 4. What to ask the seller, and what to check on a test drive or with a mechanic's pre-purchase inspection.
 5. What this scan can't tell me (brakes, suspension, rust, transmission health, ABS/airbag).
 
-Keep it short and skimmable.`;
+Keep it short and skimmable.${EXTRA_COMMANDS_HELP}`;
 
 const fmt = (v) => `${v.value} ${v.unit}`.trim() + (v.imperial ? ` (${v.imperial})` : "");
 const r3 = (n) => Math.round(n * 1000) / 1000;
@@ -433,3 +447,80 @@ export function buildReport(d) {
   L.push("", "Notes: generic OBD-II (engine/emissions only; no ABS/airbag). Fuel trims: positive = adding fuel (lean), negative = removing fuel (rich).");
   return L.join("\n");
 }
+
+
+// --------------------------------------------------------------------------- extra commands (read-only)
+// The AI can ask for manufacturer-specific data (tire pressure, transmission, ABS...) by replying with a
+// CARSCAN-COMMANDS block. Only read requests are allowed; anything that could clear codes, change settings,
+// unlock or reprogram a module is blocked before it reaches the car.
+const READ_SERVICES = new Set(["01", "02", "03", "05", "06", "07", "09", "0A", "18", "19", "1A", "21", "22"]);
+const SAFE_AT = [
+  /^ATSH[0-9A-F]{3}$/, /^ATSH[0-9A-F]{6}$/, /^ATCRA([0-9A-FX]{3}|[0-9A-FX]{8})?$/, /^ATCAF[01]$/,
+  /^ATH[01]$/, /^ATS[01]$/, /^ATST[0-9A-F]{2}$/, /^ATAT[012]$/, /^ATAL$/, /^ATNL$/, /^ATDPN?$/, /^ATRV$/,
+  /^ATI$/, /^ATCEA([0-9A-F]{2})?$/, /^ATFCSH[0-9A-F]{3,8}$/, /^ATFCSD[0-9A-F]{2,10}$/, /^ATFCSM[0-2]$/,
+  /^ATTA[0-9A-F]{2}$/, /^ATSR[0-9A-F]{2}$/,
+];
+export const MAX_EXTRA_COMMANDS = 40;
+
+export function checkCommand(raw) {
+  const cmd = raw.toUpperCase().replace(/\s+/g, "");
+  if (!cmd) return { ok: false, cmd, reason: "empty" };
+  if (cmd.startsWith("AT")) {
+    return SAFE_AT.some((re) => re.test(cmd)) ? { ok: true, cmd }
+      : { ok: false, cmd, reason: "adapter setting not on the safe list" };
+  }
+  if (!/^([0-9A-F]{2}){1,14}$/.test(cmd)) return { ok: false, cmd, reason: "not a valid hex request" };
+  const svc = cmd.slice(0, 2);
+  if (svc === "04" || svc === "14") return { ok: false, cmd, reason: "would clear trouble codes" };
+  if (!READ_SERVICES.has(svc)) return { ok: false, cmd, reason: `service ${svc} can change the car or unlock a module` };
+  return { ok: true, cmd };
+}
+
+export function parseCommands(text) {
+  let lines = text.replace(/\r/g, "").split("\n");
+  const start = lines.findIndex((l) => /CARSCAN-COMMANDS/i.test(l));
+  if (start >= 0) {
+    lines = lines.slice(start + 1);
+    const end = lines.findIndex((l) => /^\s*(END|```)\s*$/i.test(l));
+    if (end >= 0) lines = lines.slice(0, end);
+  }
+  return lines
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("```") && !/^END$/i.test(l))
+    .map((l) => {
+      const [c, ...rest] = l.split(/\s*[|#]\s*/);
+      return { raw: c.trim(), label: rest.join(" ").trim(), ...checkCommand(c) };
+    })
+    .slice(0, MAX_EXTRA_COMMANDS);
+}
+
+export async function runExtraCommands(elm, commands, onStep = () => {}) {
+  const results = [];
+  let i = 0;
+  try {
+    for (const c of commands) {
+      i++;
+      if (!c.ok) { results.push({ ...c, response: `BLOCKED (${c.reason})` }); continue; }
+      onStep(`Running ${i} of ${commands.length}…`);
+      const lines = await elm.cmd(c.cmd, 4000);
+      results.push({ ...c, response: lines.join(" / ") || "(no reply)" });
+    }
+  } finally {
+    // put the adapter back to normal so later reads still work
+    try {
+      await elm.cmd("ATD");
+      for (const x of ["ATE0", "ATL0", "ATS0", "ATH0"]) await elm.cmd(x);
+      await elm.cmd("0100", 8000);
+    } catch {}
+  }
+  return results;
+}
+
+export function buildExtraReport(results, vin) {
+  const L = [`EXTRA COMMAND RESULTS (${new Date().toLocaleString()})`, `VIN: ${vin || "unknown"}`, ""];
+  for (const r of results) L.push(`${r.cmd}${r.label ? ` (${r.label})` : ""} -> ${r.response}`);
+  L.push("", "Raw adapter replies. NO DATA or 7F xx 31/11/12 means the car didn't support that request.");
+  return L.join("\n");
+}
+
+export const EXTRA_QUESTION = `Here are the results of the extra commands you asked for, run on the same car. Decode them into real values (show your math briefly), say which requests failed, and update your diagnosis. If something important is still missing, you can send one more CARSCAN-COMMANDS block.`;

@@ -115,6 +115,12 @@ export class MockTransport {
       for (let i = 12; i < blob.length; i += 14) frames.push(blob.slice(i, i + 14));
       return "014\r" + frames.map((f, i) => `${i}:${f}`).join("\r");
     }
+    if (mode === "22" && rest.length >= 4) {
+      // simulated manufacturer data: DIDs starting 28xx answer (e.g. tire pressures), others "not supported"
+      const did = rest.slice(0, 4);
+      if (did.startsWith("28")) return "62" + did + H([Math.round(32 + n(3)) * 4 & 0xff]);
+      return "7F2231";
+    }
     return "NO DATA";
   }
 

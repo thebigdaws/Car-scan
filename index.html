@@ -50,6 +50,11 @@
   .ais a, .secondary { display: block; text-align: center; text-decoration: none; color: var(--ink); background: var(--chip);
     border: 0; border-radius: 12px; padding: 12px 6px; font-family: inherit; font-size: 15px; font-weight: 600; }
   .secondary { width: 100%; margin-top: 8px; }
+  textarea { width: 100%; min-height: 120px; font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; padding: 10px;
+    border-radius: 10px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); resize: vertical; }
+  .row { display: grid; grid-template-columns: 1fr 2fr; gap: 8px; margin-top: 8px; }
+  .row .secondary, .row .primary { margin: 0; padding: 12px 6px; font-size: 15px; }
+  .ok { color: var(--ok); } .bad { color: var(--warn); }
   details summary { cursor: pointer; color: var(--muted); font-size: 14px; }
   pre { white-space: pre-wrap; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 10px 0 0; max-height: 50vh; overflow: auto; }
   .toast { position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom) + 24px); transform: translateX(-50%) translateY(20px);
@@ -111,6 +116,18 @@
       <button class="secondary" id="copyBtn">Copy report</button>
     </div>
 
+    <div class="card" id="extraCard">
+      <p class="label">More data (optional)</p>
+      <p class="hint" style="margin:0 0 10px">If your AI replies with a <b>CARSCAN-COMMANDS</b> block (for tire pressure, transmission, ABS…), copy its reply and paste it here. The app only runs read-only commands and blocks anything that could change the car.</p>
+      <textarea id="extraInput" placeholder="CARSCAN-COMMANDS&#10;ATSH 7E1 | transmission module&#10;22 1E1C | transmission fluid temp&#10;END"></textarea>
+      <div class="row">
+        <button class="secondary" id="pasteBtn">Paste</button>
+        <button class="primary" id="runExtraBtn">Run commands</button>
+      </div>
+      <p class="hint" id="extraStatus"></p>
+      <pre id="extraOut" hidden></pre>
+    </div>
+
     <div class="card">
       <details><summary>See the full report</summary><pre id="report"></pre></details>
     </div>
@@ -121,12 +138,13 @@
 <div class="toast" id="toast"></div>
 
 <script type="module">
-import { scan, buildReport, QUESTION, USED_CAR_QUESTION, describe } from "./obd.js";
+import { scan, buildReport, QUESTION, USED_CAR_QUESTION, describe, ELM327,
+  parseCommands, runExtraCommands, buildExtraReport, EXTRA_QUESTION } from "./obd.js";
 import { MockTransport, SCENARIOS } from "./mock.js";
 import { BleTransport } from "./obd.js";
 
 const $ = (id) => document.getElementById(id);
-const state = { source: "real", purpose: "diagnose", message: "" };
+const state = { source: "real", purpose: "diagnose", message: "", elm: null, vin: null, scenario: null };
 
 function segmented(id, key, onChange) {
   $(id).addEventListener("click", (e) => {
@@ -152,8 +170,13 @@ $("scanBtn").addEventListener("click", async () => {
   $("error").style.display = "none"; $("result").style.display = "none";
   $("scanBtn").disabled = true; $("status").classList.add("on"); setStep("Starting…");
   try {
-    const transport = state.source === "mock" ? new MockTransport($("scenario").value) : new BleTransport();
-    const data = await scan(transport, { sampleSeconds: 10, onStep: setStep });
+    try { await state.elm?.close(); } catch {}
+    state.elm = null;
+    state.scenario = $("scenario").value;
+    const transport = state.source === "mock" ? new MockTransport(state.scenario) : new BleTransport();
+    const data = await scan(transport, { sampleSeconds: 10, onStep: setStep, keepOpen: true });
+    state.elm = data.elm; state.vin = data.vehicle.vin;
+    $("extraOut").hidden = true; $("extraStatus").textContent = ""; $("extraInput").value = "";
     const report = buildReport(data);
     state.message = `${state.purpose === "buying" ? USED_CAR_QUESTION : QUESTION}\n\n${report}`;
     setSendLinks();
@@ -211,6 +234,46 @@ $("shareFileBtn").addEventListener("click", async () => {
   if (await copy()) toast("File sharing isn't available here. Report copied: paste it into your AI.");
 });
 $("copyBtn").addEventListener("click", async () => toast((await copy()) ? "Report copied" : "Couldn't copy. Open the full report and select it."));
+$("pasteBtn").addEventListener("click", async () => {
+  try { $("extraInput").value = await navigator.clipboard.readText(); }
+  catch { toast("Couldn't read the clipboard. Long-press the box and tap Paste."); }
+});
+
+async function liveAdapter() {
+  const t = state.elm?.t;
+  const alive = t && (t.simulated || t.device?.gatt?.connected);
+  if (alive) return state.elm;
+  $("extraStatus").textContent = "Reconnecting to the adapter…";
+  const elm = new ELM327(state.source === "mock" ? new MockTransport(state.scenario) : new BleTransport());
+  await elm.initialize();
+  state.elm = elm;
+  return elm;
+}
+
+$("runExtraBtn").addEventListener("click", async () => {
+  const cmds = parseCommands($("extraInput").value);
+  if (!cmds.length) { toast("Paste your AI's CARSCAN-COMMANDS block first"); return; }
+  const blocked = cmds.filter((c) => !c.ok).length;
+  $("runExtraBtn").disabled = true;
+  $("extraStatus").textContent = "";
+  try {
+    const elm = await liveAdapter();
+    const results = await runExtraCommands(elm, cmds, (t) => { $("extraStatus").textContent = t; });
+    const report = buildExtraReport(results, state.vin);
+    state.message = `${EXTRA_QUESTION}\n\n${report}`;
+    setSendLinks();
+    $("extraOut").textContent = report; $("extraOut").hidden = false;
+    $("extraStatus").innerHTML = `<span class="ok">Ran ${cmds.length - blocked} command${cmds.length - blocked === 1 ? "" : "s"}.</span>`
+      + (blocked ? ` <span class="bad">Blocked ${blocked} unsafe one${blocked === 1 ? "" : "s"}.</span>` : "")
+      + " The Share and Send buttons now send these results.";
+    toast("Results ready. Tap Share or Send to send them back");
+  } catch (e) {
+    $("extraStatus").innerHTML = `<span class="bad">${e?.message || e}</span>`;
+  } finally {
+    $("runExtraBtn").disabled = false;
+  }
+});
+
 function setSendLinks() {
   document.querySelectorAll(".ais a[data-url]").forEach((a) => { a.href = a.dataset.url + encodeURIComponent(state.message); });
 }
