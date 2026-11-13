@@ -140,14 +140,36 @@ export class ELM327 {
   }
 
   static payloads(lines) {
+    // Several computers can answer one request. Single-frame replies arrive one per line; multi-frame (CAN)
+    // replies arrive as an optional length line ("014") followed by "0:", "1:", ... Each "0:" starts a new message.
     lines = lines.map((l) => l.replace(/ /g, ""));
-    if (lines.some((l) => /^[0-9A-F]:/.test(l))) {
-      const lenLine = lines.find((l) => /^[0-9A-F]{3}$/.test(l));
-      const len = lenLine ? parseInt(lenLine, 16) : null;
-      const blob = fromHex(lines.filter((l) => /^[0-9A-F]:/.test(l)).map((l) => l.slice(2)).join(""));
-      return [len ? blob.slice(0, len) : blob];
+    const out = [];
+    let frames = null, len = null;
+    const flush = () => {
+      if (frames) { const blob = fromHex(frames.join("")); out.push(len ? blob.slice(0, len) : blob); }
+      frames = null; len = null;
+    };
+    for (const l of lines) {
+      if (/^[0-9A-F]{3}$/.test(l)) { flush(); len = parseInt(l, 16); continue; }
+      const m = l.match(/^([0-9A-F]):([0-9A-F]*)$/);
+      if (m) {
+        if (m[1] === "0" && frames?.length) flush();
+        (frames ||= []).push(m[2]);
+        continue;
+      }
+      flush();
+      if (/^(?:[0-9A-F]{2})+$/.test(l)) out.push(fromHex(l));
     }
-    return lines.filter((l) => /^(?:[0-9A-F]{2})+$/.test(l)).map(fromHex);
+    flush();
+    return out;
+  }
+
+  async pidAll(pid) {
+    const out = [];
+    for (const p of ELM327.payloads(await this.cmd(`01${hex2(pid)}`))) {
+      if (p.length >= 2 && p[0] === 0x41 && p[1] === pid) out.push(p.slice(2));
+    }
+    return out;
   }
 
   async pid(pid) {
@@ -168,10 +190,12 @@ export class ELM327 {
   async loadSupported() {
     this.supported = new Set();
     for (let base = 0; base <= 0xa0; base += 0x20) {
-      const d = await this.pid(base);
-      if (!d || d.length < 4) break;
-      const bits = ((d[0] << 24) | (d[1] << 16) | (d[2] << 8) | d[3]) >>> 0;
-      for (let i = 0; i < 32; i++) if (bits & (2 ** (31 - i))) this.supported.add(base + i + 1);
+      const replies = (await this.pidAll(base)).filter((d) => d.length >= 4);
+      if (!replies.length) break;
+      for (const d of replies) {
+        const bits = ((d[0] << 24) | (d[1] << 16) | (d[2] << 8) | d[3]) >>> 0;
+        for (let i = 0; i < 32; i++) if (bits & (2 ** (31 - i))) this.supported.add(base + i + 1);
+      }
       if (!this.supported.has(base + 0x20)) break;
     }
   }
@@ -204,21 +228,25 @@ export class ELM327 {
   }
 
   async readiness() {
-    const d = await this.pid(0x01);
-    if (!d || d.length < 4) return null;
-    const [a, b, c, dd] = d;
-    const diesel = !!(b & 0x08);
-    const monitors = {};
-    [[0, "misfire"], [1, "fuel_system"], [2, "comprehensive_components"]].forEach(([bit, name]) => {
-      if (b & (1 << bit)) monitors[name] = b & (1 << (bit + 4)) ? "NOT READY" : "complete";
-    });
-    (diesel ? DIESEL_MONITORS : SPARK_MONITORS).forEach((name, bit) => {
-      if (name && c & (1 << bit)) monitors[name] = dd & (1 << bit) ? "NOT READY" : "complete";
-    });
-    return {
-      mil: !!(a & 0x80), engineType: diesel ? "diesel" : "gasoline", monitors,
-      notReady: Object.keys(monitors).filter((k) => monitors[k] === "NOT READY"),
-    };
+    let best = null, mil = false;
+    for (const d of await this.pidAll(0x01)) {
+      if (d.length < 4) continue;
+      const [a, b, c, dd] = d;
+      mil ||= !!(a & 0x80);
+      const diesel = !!(b & 0x08);
+      const monitors = {};
+      [[0, "misfire"], [1, "fuel_system"], [2, "comprehensive_components"]].forEach(([bit, name]) => {
+        if (b & (1 << bit)) monitors[name] = b & (1 << (bit + 4)) ? "NOT READY" : "complete";
+      });
+      (diesel ? DIESEL_MONITORS : SPARK_MONITORS).forEach((name, bit) => {
+        if (name && c & (1 << bit)) monitors[name] = dd & (1 << bit) ? "NOT READY" : "complete";
+      });
+      if (!best || Object.keys(monitors).length > Object.keys(best.monitors).length) {
+        best = { engineType: diesel ? "diesel" : "gasoline", monitors };
+      }
+    }
+    if (!best) return null;
+    return { mil, ...best, notReady: Object.keys(best.monitors).filter((k) => best.monitors[k] === "NOT READY") };
   }
 
   async freezeFrame() {
@@ -399,7 +427,8 @@ Answer in this order:
 
 Keep it short and skimmable.${EXTRA_COMMANDS_HELP}`;
 
-const fmt = (v) => `${v.value} ${v.unit}`.trim() + (v.imperial ? ` (${v.imperial})` : "");
+const fmt = (v) => (v.imperial ? `${v.imperial} (${v.value} ${v.unit})` : `${v.value} ${v.unit}`.trim());
+const toF = (c) => Math.round((c * 9) / 5 + 32);
 const r3 = (n) => Math.round(n * 1000) / 1000;
 
 export function buildReport(d) {
@@ -407,7 +436,9 @@ export function buildReport(d) {
   const now = new Date();
   L.push(`CAR SCAN REPORT (${now.toLocaleString()})`);
   if (d.vehicle.simulated) L.push("NOTE: test scan of a simulated car (mock mode), not a real vehicle.");
+  if (d.vehicle.decoded) L.push(`Vehicle: ${d.vehicle.decoded}`);
   L.push(`VIN: ${d.vehicle.vin || "unknown"} | Battery: ${d.vehicle.battery || "?"} | Adapter: ${d.vehicle.adapter}`);
+  if (!d.engineRunning) L.push("NOTE: engine was OFF during this scan, so live data is limited.");
 
   L.push("", "== TROUBLE CODES ==");
   L.push(`Check engine light: ${d.readiness?.mil ? "ON" : "off"}`);
@@ -431,7 +462,9 @@ export function buildReport(d) {
   if (d.sampled) {
     L.push("", `== RECORDED ${d.sampled.seconds} SECONDS (min / avg / max) ==`);
     for (const [k, s] of Object.entries(d.sampled.sensors)) {
-      let line = `${k}: ${r3(s.min)} / ${r3(s.avg)} / ${r3(s.max)} ${s.unit}`;
+      let line = s.unit === "C"
+        ? `${k}: ${toF(s.min)} / ${toF(s.avg)} / ${toF(s.max)} F`
+        : `${k}: ${r3(s.min)} / ${r3(s.avg)} / ${r3(s.max)} ${s.unit}`;
       if (s.switches !== undefined) line += `, switched ${s.switches}x across 0.45 V`;
       L.push(line);
     }
@@ -524,3 +557,71 @@ export function buildExtraReport(results, vin) {
 }
 
 export const EXTRA_QUESTION = `Here are the results of the extra commands you asked for, run on the same car. Decode them into real values (show your math briefly), say which requests failed, and update your diagnosis. If something important is still missing, you can send one more CARSCAN-COMMANDS block.`;
+
+
+// --------------------------------------------------------------------------- vehicle lookup (free NHTSA service)
+export async function decodeVin(vin, timeoutMs = 5000) {
+  if (!vin || vin.length !== 17) return null;
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), timeoutMs);
+    const r = await fetch(`https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/${vin}?format=json`, { signal: ctl.signal });
+    clearTimeout(t);
+    const v = (await r.json()).Results?.[0];
+    if (!v?.Make) return null;
+    const cap = (x) => x ? x.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase()) : "";
+    const engine = [
+      v.DisplacementL && `${(+v.DisplacementL).toFixed(1)}L`,
+      v.EngineCylinders && `${v.EngineCylinders}-cyl`,
+      v.EngineConfiguration?.startsWith("V") ? "V" : "",
+      /turbo/i.test(`${v.Turbo} ${v.EngineModel}`) ? "turbo" : "",
+      v.FuelTypePrimary && v.FuelTypePrimary !== "Gasoline" ? v.FuelTypePrimary.toLowerCase() : "",
+      v.ElectrificationLevel && !/^$/.test(v.ElectrificationLevel) ? v.ElectrificationLevel.toLowerCase() : "",
+    ].filter(Boolean).join(" ");
+    return [v.ModelYear, cap(v.Make), v.Model, v.Trim].filter(Boolean).join(" ") + (engine ? ` (${engine})` : "");
+  } catch { return null; }
+}
+
+// --------------------------------------------------------------------------- quick findings shown on screen
+export function quickFindings(d) {
+  const f = [];
+  const add = (level, text) => f.push({ level, text });
+  const live = d.live || {}, sc = d.sinceCleared || {};
+  const all = [...new Set([...d.codes.stored, ...d.codes.pending, ...d.codes.permanent])];
+  if (d.readiness?.mil) add("bad", "Check engine light is on.");
+  if (d.codes.pending.length) add("warn", `Pending code${d.codes.pending.length > 1 ? "s" : ""} ${d.codes.pending.join(", ")}: detected but not confirmed yet.`);
+  if (d.codes.permanent.length && !d.codes.stored.length) add("bad", "Permanent codes with no stored codes: codes were likely cleared without a fix.");
+  const warm = sc.warmups_since_codes_cleared?.value, km = sc.distance_since_codes_cleared?.value;
+  if ((warm !== undefined && warm < 10) || (km !== undefined && km < 160)) {
+    add("bad", `Codes were cleared recently (${km !== undefined ? `${Math.round(km * 0.621)} miles` : `${warm} warm-ups`} ago).`);
+  }
+  if (d.readiness?.notReady?.length) add("warn", `${d.readiness.notReady.length} emissions self-test${d.readiness.notReady.length > 1 ? "s" : ""} not finished. May not pass inspection yet.`);
+  for (const b of [1, 2]) {
+    const lt = live[`long_fuel_trim_bank${b}`]?.value, st = live[`short_fuel_trim_bank${b}`]?.value ?? 0;
+    if (lt === undefined) continue;
+    if (lt + st > 15 || lt > 10) add("warn", `Engine is running lean${b === 2 ? " (bank 2)" : ""}: computer adding ${Math.round(lt + st)}% fuel.`);
+    else if (lt + st < -15 || lt < -10) add("warn", `Engine is running rich${b === 2 ? " (bank 2)" : ""}: computer removing ${Math.round(-(lt + st))}% fuel.`);
+  }
+  const volts = live.control_module_voltage?.value;
+  if (volts) {
+    if (d.engineRunning && volts < 13.2) add("warn", `Charging voltage low (${volts.toFixed(1)} V). Check battery/alternator.`);
+    else if (d.engineRunning && volts > 15.2) add("warn", `Charging voltage high (${volts.toFixed(1)} V).`);
+    else if (!d.engineRunning && volts < 12.2) add("warn", `Battery is low (${volts.toFixed(1)} V with engine off).`);
+  }
+  const ct = live.coolant_temp?.value;
+  if (ct !== undefined && ct > 108) add("bad", `Engine is hot (${Math.round((ct * 9) / 5 + 32)}°F). Stop and let it cool.`);
+  const run = live.run_time_since_start?.value;
+  if (ct !== undefined && d.engineRunning && run > 900 && ct < 70) add("warn", "Engine isn't warming up fully. Possible stuck-open thermostat.");
+  const up = d.sampled?.sensors?.o2_bank1_sensor1_voltage, down = d.sampled?.sensors?.o2_bank1_sensor2_voltage;
+  if (up?.switches >= 3 && down?.switches >= 3 && down.max - down.min > 0.4) add("warn", "Rear O2 sensor is copying the front one. Catalytic converter may be worn.");
+  if (!d.engineRunning) add("info", "Engine was off. Start it and scan again for live data and a much better diagnosis.");
+  if (!all.length && !f.some((x) => x.level !== "info")) add("ok", "No codes and nothing unusual in the readings.");
+  return f;
+}
+
+// --------------------------------------------------------------------------- the message sent to the AI
+export function buildMessage({ report, purpose, symptoms }) {
+  const q = purpose === "buying" ? USED_CAR_QUESTION : QUESTION;
+  const notes = symptoms?.trim() ? `\n\nWHAT THE OWNER NOTICES: ${symptoms.trim()}` : "";
+  return `${q}${notes}\n\n${report}`;
+}
