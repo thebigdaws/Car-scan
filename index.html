@@ -226,7 +226,8 @@ segmented("purpose", "purpose", refreshMessage);
 $("symptoms").addEventListener("input", refreshMessage);
 
 function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("on"); setTimeout(() => t.classList.remove("on"), 2400); }
-const setStep = (s) => { $("statusText").textContent = s; };
+let lastStep = "";
+const setStep = (s) => { lastStep = s; $("statusText").textContent = s; };
 
 // ---- the message the Share/Send buttons send (always current: question + symptoms + report, or extra results)
 function refreshMessage() {
@@ -254,7 +255,8 @@ $("scanBtn").addEventListener("click", async () => {
   } catch (e) {
     const msg = e?.name === "NotFoundError" ? "No adapter picked. Tap Scan again and choose your OBD adapter from the list."
       : e?.name === "NetworkError" ? "Lost the Bluetooth connection. Make sure the adapter is plugged in and the ignition is on, then try again."
-      : (e?.message || String(e));
+      : e?.message ? e.message
+      : `Something went wrong while "${lastStep.replace(/…$/, "")}" (error: ${String(e)}). Unplug the adapter for 10 seconds, plug it back in, reopen Bluefy and tap Scan again.`;
     $("error").textContent = msg; $("error").style.display = "block";
   } finally {
     $("scanBtn").disabled = false; $("status").classList.remove("on");

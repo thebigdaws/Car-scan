@@ -9,6 +9,17 @@ const BLE_SERVICES = [
   "0000fff0-0000-1000-8000-00805f9b34fb",
 ];
 
+// Bluefy sometimes rejects with a bare number instead of an Error. Turn that into something readable.
+function btErr(step, e) {
+  if (e instanceof Error && e.name && e.name !== "Error") return e;
+  const code = e?.code ?? (typeof e === "number" || /^\d+$/.test(String(e)) ? String(e) : null);
+  const err = new Error(`Bluetooth error while ${step}${code !== null ? ` (code ${code})` : e?.message ? `: ${e.message}` : ""}. `
+    + "Unplug the adapter for 10 seconds, plug it back in, close and reopen Bluefy, then tap Scan again. "
+    + "If your phone's Bluetooth settings list the adapter, tap Forget This Device first.");
+  err.name = "BtError";
+  return err;
+}
+
 export class BleTransport {
   constructor() { this.buf = ""; this.waiter = null; }
 
@@ -18,21 +29,30 @@ export class BleTransport {
     }
     this.device = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: BLE_SERVICES });
     const server = await this.device.gatt.connect();
-    let write = null, notify = null;
-    for (const svc of await server.getPrimaryServices()) {
-      let w = null, n = null;
-      for (const ch of await svc.getCharacteristics()) {
-        const p = ch.properties;
-        if (!n && (p.notify || p.indicate)) n = ch;
-        if (!w && (p.write || p.writeWithoutResponse)) w = ch;
-      }
-      if (w && n && (!write || svc.uuid.includes("fff0"))) { write = w; notify = n; }
+    // Some adapters expose several services; some characteristics refuse notifications (Bluefy then rejects
+    // with a bare number like 2). Try every write+notify pair, known OBD services first, and keep the first that works.
+    const known = ["fff0", "ffe0", "18f0", "ffb0", "fee7", "e7810a71"];
+    const rank = (uuid) => { const i = known.findIndex((k) => uuid.toLowerCase().includes(k)); return i < 0 ? 99 : i; };
+    let services = [];
+    try { services = await server.getPrimaryServices(); } catch (e) { throw btErr("reading the adapter's services", e); }
+    services.sort((a, b) => rank(a.uuid) - rank(b.uuid));
+    const pairs = [];
+    for (const svc of services) {
+      let chars = [];
+      try { chars = await svc.getCharacteristics(); } catch { continue; }
+      const writes = chars.filter((c) => c.properties.write || c.properties.writeWithoutResponse);
+      const notifies = chars.filter((c) => c.properties.notify || c.properties.indicate);
+      for (const n of notifies) for (const w of writes) pairs.push([w, n]);
     }
-    if (!write) throw new Error("Connected, but this doesn't look like an OBD adapter (no serial channel found). Pick the adapter's name in the list.");
-    this.write = write;
-    this.withResponse = !!write.properties.write;
-    await notify.startNotifications();
-    notify.addEventListener("characteristicvaluechanged", (e) => {
+    if (!pairs.length) throw new Error("Connected, but this doesn't look like an OBD adapter (no serial channel found). Pick the adapter's name in the list.");
+    let lastErr = null;
+    for (const [w, n] of pairs) {
+      try { await n.startNotifications(); this.write = w; this.notify = n; break; }
+      catch (e) { lastErr = e; }
+    }
+    if (!this.write) throw btErr("turning on the adapter's data channel", lastErr);
+    this.withResponse = !!this.write.properties.write;
+    this.notify.addEventListener("characteristicvaluechanged", (e) => {
       this.buf += new TextDecoder().decode(e.target.value);
       if (this.buf.includes(">") && this.waiter) { const w = this.waiter; this.waiter = null; w(); }
     });
@@ -43,8 +63,17 @@ export class BleTransport {
     this.buf = "";
     const data = new TextEncoder().encode(cmd + "\r");
     const done = new Promise((res) => { this.waiter = res; setTimeout(res, timeout); });
-    if (this.withResponse) await this.write.writeValueWithResponse(data);
-    else await this.write.writeValueWithoutResponse(data);
+    try {
+      if (this.withResponse) await this.write.writeValueWithResponse(data);
+      else await this.write.writeValueWithoutResponse(data);
+    } catch (e) {
+      // Some adapters advertise one write mode but only accept the other.
+      try {
+        if (this.withResponse) await this.write.writeValueWithoutResponse(data);
+        else await this.write.writeValueWithResponse(data);
+        this.withResponse = !this.withResponse;
+      } catch { throw btErr(`sending "${cmd}" to the adapter`, e); }
+    }
     await done;
     this.waiter = null;
     return this.buf;
